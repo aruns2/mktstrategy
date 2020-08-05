@@ -1,0 +1,767 @@
+---
+title: "Customer Life-Time Value"
+author: "Ahmed, Arun, Sanjay- Group 7 "
+date: "12/6/2019"
+output: 
+  html_document:
+    theme: paper
+    highlight: tango
+    toc: true
+    toc_depth: 5
+---
+### 0. Problem Summary
+
+(.) 1. Develop an **attrition model**, to predict whether a customer will cancel their subscription in the near future. Characterize your model performance.
+(.) 2. Develop a model for estimating the **ltv** of a customer. Characterize your model performance.
+(✓) 3. Develop a **customer segmentation** scheme. Include in this scheme the identification of sleeping customers, those that are no longer active but have not
+canceled their account.
+
+
+#### About the dataset:
+- id: A unique user identifier
+- status: Subscription status:‘0’- new, ‘1’- open, ‘2’- cancelation event
+- gender: User gender ‘M’- male ‘F’- female
+- date: Date of in which user ‘id’ logged into the site
+- pages: Number of pages visted by user ‘id’ on date ‘date’
+- onsite: Number of minutes spent on site by user ‘id’ on date ‘date’
+- entered: Flag indicating whether or not user entered the send order path on date ‘date’
+- completed: Flag indicating whether the user completed the order (sent an eCard)
+- holiday: Flag indicating whether at least one completed order included a holiday themed card
+
+
+```{r global_options, include=FALSE, fig.width = 10}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+```
+
+```{r, warning = FALSE, message=FALSE}
+# Import libraries
+library(plyr)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(cluster)
+library(factoextra)
+library('dplyr')
+library("readxl")
+library(knitr)
+library(leaps)
+library(boot)
+```
+
+
+### 1. Exploratory Data Analysis
+
+```{r}
+ltv.data <- read.csv('ltv Dataset.csv')
+head(ltv.data)
+```
+
+```{r,warning = FALSE, message=FALSE}
+ltv.data <- ltv.data %>% mutate_at(vars(id, status, gender, entered, completed, holiday), funs(as.factor(.)))
+ltv.data$date <- as.Date(ltv.data$date, '%m/%d/%Y')
+summary(ltv.data)
+```
+
+#### 1.1. Missing values
+
+```{r}
+sapply(ltv.data, function(x) sum(is.na(x)))
+```
+
+**Observation:** There are no missing values in the data
+
+#### 1.2. Extreme values
+
+```{r}
+hist(ltv.data$pages)
+hist(ltv.data$onsite)
+```
+
+**Observation**: 'Onsite' has some extreme values
+
+```{r}
+# Quantiles
+quantile(ltv.data$onsite, c(0,.1,.25,.5,.75,.9,.95,.99,1))
+```
+
+**Action:** Cap observations where user has spent more than 60 minutes on the website to 60 minutes
+
+#### 1.3. Cap obervations where user spent more then 60 minutes to 60 minutes
+
+```{r}
+ltv.data[ltv.data$onsite>60,"onsite"] <- 60
+summary(ltv.data)
+```
+
+#### 1.4. Gender and Tenure
+
+
+```{r}
+# Number of users
+print(paste0("Number of users: " , n_distinct(ltv.data$id)))
+
+# Number of users by gender
+print("Users by gender:")
+print.data.frame(ltv.data %>% group_by(gender) %>% summarise(count = n_distinct(id)))
+
+```
+
+```{r}
+# Attrition
+att.summ <- ltv.data %>% mutate(month = format(date, "%m"), year = format(date, "%Y")) %>% group_by(year, status) %>% summarise(count = n_distinct(id))
+
+att.summ$status <- mapvalues(att.summ$status, 
+          from=c(0,1,2), 
+          to=c("new","open","cancelled"))
+
+ggplot(att.summ, aes(x = year, y = count,fill=status)) +
+    geom_bar(stat='identity')
+```
+
+
+
+```{r setup, include=FALSE}
+rm(list = ls())
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(tidyverse)
+library(plyr)
+library(dplyr)
+library(reshape2)
+library(GGally)
+library(caret)
+
+
+```
+
+
+
+# 2. Predicting if the customer will cancel their subscription
+
+Multiple researches have shown that it could be more expensive to retain a customer than to create a new customer. Hence, it is of high interest to be able to predict customers who mightleave the business in near future and adopt some strategies to prevent such customers could be of high business value.
+
+
+```{r, include= FALSE}
+# reading data
+ltv.data <- read.csv("ltv Dataset.csv")
+
+#converting to date format
+ltv.data$date <- as.Date.factor(ltv.data$date, "%m/%d/%Y")
+
+```
+
+## 2.1 Feature Engineering
+
+While carying out EDA, we noticed that we are intersted in the variable `status` which tracks the customer status i.e. if the customer joined recently `0`, or if he is still ther `1` or if he left `2`. In order to facilitate our analysis we will create a new variable, `is.churn` with values `1` if the customer has churned (attrition) else `0`. The two level variable will give us mor eflexibility in terms of model such as Logistic Regression without compromising on the information quality.
+
+Further, to assist in our analysis we will create new variables that will capture the existing information in a better way.
+
+1. `total.time` =  how much time in total the customer spent
+2. `avg.time` = average time spent per customer
+3. `total.pg` = total number of pages visited by customer
+4. `avg.pg` = average number of pages visited by customer
+5. `avg.entered` = average path entered
+6. `avg.completed`  = average path completed
+7. `avg,intertime` = average intertime spent by a customer. Intertime being the duration     between two consecutive vists by the customer
+8. `last.seen` = the last seen for the customer relative to `31-12-2014`
+9. `tenure` = total time for which customer remained with us as a customer.
+
+
+```{r, echo= FALSE}
+#identifying customers who churned is.churn = 1
+
+ltv.data$is.churn <- 0
+
+customer.churn<- unique(ltv.data[ltv.data$id %in% c(ltv.data[ltv.data$status == 2,]$id),]$id)
+ltv.data[ltv.data$id %in% customer.churn,]$is.churn <- 1
+
+#customers who did not churn
+customer.notchurn <- unique(ltv.data[!ltv.data$id %in% c(ltv.data[ltv.data$status == 2,]$id),]$id)
+
+#calculate intertime visit
+ltv.data <- ddply(ltv.data, "id", transform, inter.time = c(0, diff(date)))
+
+#unique(ltv.data[,c(1,10)])
+add.days <- ltv.data[ltv.data$id %in% customer.notchurn,] %>% 
+  dplyr::group_by(id) %>% 
+  dplyr::summarise(diff= as.Date("31/12/2014", "%d/%m/%Y")- max(date))
+
+#adding frequency
+
+max.date <- ltv.data %>% 
+  dplyr::group_by(id) %>% 
+  dplyr:: summarise(max.date = max(date))
+
+ltv.data <- merge(ltv.data, max.date, by = "id")
+ltv.data$len.final <- ltv.data$max.date - ltv.data$date
+ltv.data$last.seen <- as.Date("31/12/2014", "%d/%m/%Y")-ltv.data$max.date
+
+summary.data <- ltv.data %>%
+  dplyr::group_by(id)%>%
+  dplyr::summarise(total.pg = sum(pages), avg.pg = mean(pages),
+                   total.time = sum(onsite), avg.time = mean(onsite),
+                   total.entered = sum(entered), avg.entered = mean(entered),
+                   total.completed = sum(completed), avg.completed = mean(completed),
+                   avg.intertime = mean(inter.time),
+                   is.churn = mean(is.churn), count.visit = n(), 
+                   transact.days = (max(date)- min(date)),
+                   last.seen = mean(last.seen))
+
+
+
+# merging the total transaction duration for customers
+
+
+final.data <- merge(summary.data, add.days, by = "id", all.x = TRUE)
+final.data[is.na(final.data$diff),]$diff <- 0
+final.data$tenure <- final.data$transact.days +final.data$diff
+
+#removing columns transact days and diff- dont need them for analysis
+final.data <- final.data[,-c(12,13)]
+
+
+#adding gender to final data
+final.data <- merge(final.data, unique(ltv.data[,c(1,3)]), by = "id")
+```
+
+
+## 2.2 Checking for correlation between the available parameters
+
+We started by analysing the corelation matrix for our features and realised that 4 out of 11 features were highly correlated. Since we were measuring total and average for the same paramters it makes sense that these were highly correlates.
+
+Consequently, we removed those features from our analysis, leaving behind 7 features to work with. Correlation matrix for the features is attached
+
+```{r, fig.width =10, fig.height=10,cache=TRUE,echo= FALSE}
+
+#checking for coorelation
+library("PerformanceAnalytics")
+mydata = final.data[, c(3,5,7,9,10,12,14)]
+mydata$tenure <- as.numeric(mydata$tenure)
+mydata$last.seen <- as.numeric(mydata$last.seen)
+chart.Correlation(mydata, histogram = TRUE, pch =18)
+
+
+# removing correlated variable from the data
+final.data1 <- final.data[, -c(2,4,6,8)]
+
+```
+
+We notice that even though we have some highly corelated variable such as avg.entered and avg.completed. We would expect that still we would use the information since its less than `0.80`. Also, we see some outliers in the distribution for last seen. These would be users which are dormant for long time or left pretty early in our case. we would move forward after replacing these with more optimal values.
+
+## 3. Selecting the best Attrition Model
+### 3.1. Tree model
+
+First, we tried a Tree model to see how we performed in our data classifiation
+
+```{r, echo= FALSE}
+library(tree)
+final.data1 <- final.data1[,-9]
+final.data1$is.churn <-  recode_factor(final.data1$is.churn, `0` = "No", `1` ="Yes")
+train <- sample(1:nrow(final.data1), 7000)
+attrition.test <- final.data1[-train,]
+attrition.test.actual <- final.data1[-train,]$is.churn
+tree.attrition <- tree(is.churn~. -id,final.data1,subset=train)
+
+tree.pred <- predict(tree.attrition,attrition.test,type="class")
+
+#confusion Matrix
+
+cm <- confusionMatrix(tree.pred, attrition.test.actual )
+
+cm
+```
+
+>The tree classification gives us a missclassification rate of = `r (1-cm$overall["Accuracy"])*100` % in our data set if we were to assign all the customers to `is.churn` = 1 we would have achieved the misclassification rate of 36.83%. SO, we have improved a little over that. However, we wish to see if we can do better.
+
+### 3.2 logistic model
+
+Next, we tried logistic model since we have only two classificantion groups.
+
+```{r, echo= FALSE}
+
+final.data$is.churn <-  recode_factor(final.data$is.churn, `0` = "No", `1` ="Yes")
+train <- sample(1:nrow(final.data), 7000)
+attrition.test <- final.data[-train,]
+attrition.test.actual <- final.data[-train,]$is.churn
+glm.attrition <- glm(is.churn~.-id,final.data,subset=train, family = "binomial")
+
+summary(glm.attrition)
+
+glm.pred <- predict(glm.attrition,attrition.test)
+table(tree.pred,attrition.test.actual)
+
+#confusion matrix
+cm <- confusionMatrix(tree.pred, attrition.test.actual )
+
+cm
+```
+
+> AS can be noted from the table our performance deteriorated further and we got the missclassification rate of `r (1-cm$overall["Accuracy"])*100` % as compared to 30.63% of the tree model.
+
+### 3.3 Randomforest
+
+In our first model, we used only a single tree and our results were ok. In this model we will use the available data sets to build random forest. or to fit multiple trees
+
+```{r,fig.width=10, fig.height=10, echo= FALSE}
+
+library(randomForest)
+
+train <- sample(1:nrow(final.data1), 7000)
+attrition.test <- final.data1[-train,]
+attrition.test.actual <- final.data1[-train,]$is.churn
+
+rf.attrition <- randomForest(is.churn ~ . -id,data=final.data1[train,],mtry = 4, importance=TRUE)
+plot(rf.attrition)
+rf.pred <- predict(rf.attrition,attrition.test)
+table(rf.pred,attrition.test.actual)
+
+#building a confusion matrix
+cm <- confusionMatrix(rf.pred, attrition.test.actual )
+
+cm
+
+```
+
+> The Random Forest model works real well and gives the missclassification rate of `r (1-cm$overall["Accuracy"])*100` %
+
+Hence, we would go ahead with the final random forest model `rf.attrition`
+
+To determine which are the features which impact whether the customer would churn or not, lets build `varImpPlot`.
+
+Following figure gives the relative importance of variables in the model.
+
+### 3.3.1 Variable Importance Plot
+
+```{r, echo= FALSE}
+kable(summary(importance(rf.attrition)))
+varImpPlot(rf.attrition)
+```
+
+The variables `Last Seen` and `tenure` are the most important features for our model. Even though they do not tell us how are these related to our model.
+
+We would like to use model to track these two variables and inform decision making.
+
+
+# 3. Estimating ltv model 
+
+Customer ltv is equal to number of months between customer subscribing and cancelling their subscription
+
+We used a regression model to estimate number of months 
+
+First we calculated lifetime value for each customer in our dataset and summary variables for their interactions
+
+Assumptions made: fractions of months are billed as full month & customers with unknown cancellation date are assumed to cancel on "12/31/2014"
+
+## 3.1 Variables and significant coeffiecients
+
+```{r, echo = FALSE}
+
+data <- read_excel("ltv.xlsx")
+
+max_date <- as.Date("2014-12-31")
+
+my_data_two <- data %>% group_by(id) %>% mutate(counter = row_number(id))
+my_data_two <- my_data_two %>% group_by(id) %>% mutate(male = ifelse(gender == "M",1,0))
+my_data_two <- my_data_two %>% group_by(id) %>% mutate(subscribed = as.Date(date[status == 0]))
+
+
+
+my_data_two <- my_data_two %>% group_by(id) %>% mutate(ended = if_else(mean(status) == 1, as.Date(max(date)), (max_date)))
+
+my_data_two_summary <- 
+  my_data_two %>% 
+  group_by(id, male, subscribed , ended) %>% 
+  summarize(num_activities = n()-2 ,
+            
+             
+            avg_time_between_activity = round(as.numeric(sum(diff(date)))/ n(),2),
+            avg_onsite = round(mean(onsite[status == 1]),2),
+            avg_pages = round(sum(pages)/ (n()),2),
+            percent_completed = as.numeric(round(sum(completed)/ (n()),2)*100),
+            num_enter_not_complete = sum(entered)-sum(completed),
+            ratio_completed_holiday =  (sum(holiday)/sum(completed))
+            
+            )
+
+my_data_two_summary <- my_data_two_summary  %>% 
+  mutate(ltv = as.numeric(ceiling(round(as.numeric((ended) - subscribed),0)/30)))
+
+my_data_summary <- as.data.frame(my_data_two_summary)
+my_data_summary[is.na(my_data_summary)] <- 0
+my_data_summary = subset(my_data_summary, select = -c(subscribed,ended,id) )
+
+```
+
+Variables created to help estimate life-time value:
+
+1. `num_activities` =  number of times customer logged in
+2. `avg_onsite` = average time spent by customer onsite
+3. `male` = dummy variable for gender where 1 indicated customer is male
+4. `avg_time_between_activity` = average time between consecutive activites by customer
+5. `avg_pages` = average number of pages each time customer enters
+6. `percent_completed`  = percentage of interactions where customer completes card
+7. `num_enter_not_complete` = number of times customer starts creating card but does not complete
+8. `ratio_completed_holiday` = ration of completed cards that are holiday cards
+9. `ltv` = total time for which customer remained with us as a customer
+
+We ran linear regression on estimating ltv using all other variables and found the bewlo variables to have statistically significant coefficients
+
+```{r , echo= FALSE}
+
+ltv.reg.model <- glm(ltv ~ . , data = my_data_summary)
+
+a <- summary(ltv.reg.model)$coeff[-1,4] < 0.05
+significant <- names(a)[a == TRUE] 
+paste(significant)
+```
+
+## 3.2 Predictor selection
+
+To choose variables to include in our final model we compared different model sizes on their R-squared, AIC score, BIC score on subsets selected using forward step-wise  selection, we also compared average MSE for 50 runs of validation set approach per subset
+
+We produced the plots below to help giude our decision
+
+```{r , echo= FALSE}
+data.subset <- regsubsets(ltv ~ .,
+               data = my_data_summary,
+               nbest = 1,    # 1 best model for each number of predictors
+               nvmax = NULL,    # NULL for no limit on number of variables
+               method = "forward", really.big = TRUE)
+
+
+x <- c(0)
+rsq <- c()
+bic <- c()
+aic <- c()
+for (i in 1:9) {
+  x[i] <- i
+  rsq[i] <- summary(data.subset)$rsq[i]
+  bic[i] <- summary(data.subset)$bic[i]
+  aic[i] <- summary(data.subset)$cp[i]
+  
+}
+
+
+
+# validation set function, code partially adopted from assignment 3 
+
+
+validation_set <- function(x) {
+
+
+
+vse <- c()
+
+for (i in 1:50) {
+  
+
+# Form a random split
+rand.split <- sample(cut(1:nrow(x), breaks = 2, labels = FALSE))
+# Fit model on first part
+ltv.glm.train <- glm(ltv ~ ., data = x[rand.split == 1,])
+# Predict on the second part
+ltv.glm.pred <- predict(ltv.glm.train, newdata = x[rand.split == 2, ])
+# Calculate MSE on the second part
+vse[i] <- mean((x$ltv[rand.split == 2] - ltv.glm.pred)^2)
+
+}
+
+avg.vse <- mean(vse)
+std.vse <- sd(vse)
+coef.var.vse <- std.vse / avg.vse
+
+return(avg.vse)
+}
+
+
+vs <- c()
+num_predictors <- c(2:8)
+
+for (i in 2:8) {
+  
+ 
+m <- my_data_summary %>% select("ltv" ,(names(coef(data.subset, id = i )))[2:i+1])
+
+vs[i-1] <- validation_set(m)
+}
+
+```
+
+```{r, echo = FALSE}
+
+par(mfrow=c(2,2))
+plot(x, rsq, 
+     xlab = "number of predictors", ylab = "R-Squared")
+plot(x, aic, 
+     xlab = "number of predictors", ylab = "AIC")
+plot(x, bic, 
+     xlab = "number of predictors", ylab = "BIC")
+
+plot(num_predictors,vs , xlab = "Number of predictors" , ylab = "Validation set MSE")
+
+```
+
+By observing the plts above we can see that there is no significant improvement on any of our score past four variables, to keep model as simple as possible we chose that our final will have four predicttors with coeffiecients displayed below
+
+## 3.3 Final Model
+
+Ou final model to predict customer lifetime value includes the variables below with their corresponding coeffiecients
+
+```{r}
+ltv.final.model <- glm(ltv ~ male + num_activities + avg_pages + ratio_completed_holiday, data = my_data_summary)
+
+
+kable(coef(ltv.final.model))
+
+```
+
+
+### Findings
+
+"male"         Keeping everyhing constant being of gender male is associated with staying a customer an average of 3 months (eqiuvilant to 3$ value)      
+"num_activities" For each login customer  does is associated with average 0.3$ more value                     
+"avg_pages"  For each page in average that customer uses on site it is associated with an average of 1.8$ decrease in expected life-time value
+"ratio_completed_holiday"  We found that a higher ratio of holiday card compared to total cards completed is associated with increased life-time value
+
+# 4. Customer Segmentation
+
+```{r, warning = FALSE, message=FALSE}
+# Import libraries
+library(plyr)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(cluster)
+library(factoextra)
+```
+
+
+
+```{r, include = FALSE}
+ltv.data <- read.csv('ltv Dataset.csv')
+head(ltv.data)
+```
+
+```{r,warning = FALSE, message=FALSE}
+ltv.data <- ltv.data %>% mutate_at(vars(id, status, gender, entered, completed, holiday), funs(as.factor(.)))
+ltv.data$date <- as.Date(ltv.data$date, '%m/%d/%Y')
+summary(ltv.data)
+```
+
+
+
+```{r, include = FALSE}
+sapply(ltv.data, function(x) sum(is.na(x)))
+```
+
+```{r,include = FALSE}
+hist(ltv.data$pages)
+hist(ltv.data$onsite)
+```
+
+
+```{r, include = FALSE}
+# Quantiles
+quantile(ltv.data$onsite, c(0,.1,.25,.5,.75,.9,.95,.99,1))
+```
+
+
+
+```{r,include = FALSE}
+ltv.data[ltv.data$onsite>60,"onsite"] <- 60
+summary(ltv.data)
+```
+
+
+```{r,include = FALSE}
+# Number of users
+print(paste0("Number of users: " , n_distinct(ltv.data$id)))
+
+# Number of users by gender
+print("Users by gender:")
+print.data.frame(ltv.data %>% group_by(gender) %>% summarise(count = n_distinct(id)))
+
+```
+
+```{r, include = FALSE}
+# Attrition
+att.summ <- ltv.data %>% mutate(month = format(date, "%m"), year = format(date, "%Y")) %>% group_by(year, status) %>% summarise(count = n_distinct(id))
+
+att.summ$status <- mapvalues(att.summ$status, 
+          from=c(0,1,2), 
+          to=c("new","open","cancelled"))
+
+ggplot(att.summ, aes(x = year, y = count,fill=status)) +
+    geom_bar(stat='identity')
+```
+
+```{r, echo = FALSE}
+# Customer tenure
+tenure <- dcast(ltv.data[ltv.data$status != 1,], id ~ status, value.var = 'date')
+tenure[,2] <- as.Date(tenure[,2],origin = "1970-01-01")
+tenure[,3] <- as.Date(tenure[,3], origin = "1970-01-01")
+tenure$tenure <- as.integer(tenure[,3] - tenure[,2]) 
+hist(tenure$tenure)
+tenure$is.attr <- "yes"
+tenure[is.na(tenure$tenure),]$is.attr <- "no"
+tenure[is.na(tenure$tenure),]$tenure <- as.Date("2014-12-31") - tenure[is.na(tenure$tenure),2]
+tenure[is.na(tenure$tenure),]$tenure <- tenure[is.na(tenure$tenure),3] - as.Date("2011-01-01")
+tenure %>%
+  ggplot(aes(x = tenure, fill = is.attr))+
+  geom_histogram(position = "stack")
+
+summary(tenure$tenure)
+
+tapply(tenure$tenure, tenure$is.attr, summary)
+
+```
+
+
+## 4.1 Feature engineering 
+
+```{r,echo = FALSE}
+# List of cancelled customers
+attr.list <- ltv.data %>% group_by(id) %>% summarise(final.status = max(as.integer(as.character(status))))
+attr.list <- attr.list$id[attr.list$final.status == 2]
+```
+
+```{r, echo = FALSE}
+# Last seen
+
+last.seen <- ltv.data %>% group_by(id) %>% summarise(diff= as.integer(as.Date("31/12/2014", "%d/%m/%Y")- max(date)))
+
+hist(last.seen$diff)
+```
+
+```{r, echo = FALSE}
+# Interarrival time
+ltv.data.copy <- ltv.data[order(ltv.data$id, ltv.data$date),]
+ltv.data.copy <- ltv.data.copy[!(ltv.data.copy$id %in% attr.list),]
+ltv.data.copy$id.lag <- lag(ltv.data.copy$id,1)
+ltv.data.copy$date.lag <- lag(ltv.data.copy$date,1)
+ltv.data.copy$time.since.last.event <- ltv.data.copy$date - ltv.data.copy$date.lag
+ltv.data.copy$time.since.last.event[ltv.data.copy$id != ltv.data.copy$id.lag] <- NA
+
+frequency <- ltv.data.copy %>% group_by(id) %>% summarise(last.seen.days= as.integer(as.Date("31/12/2014", "%d/%m/%Y")- max(date)), last.seen = max(date),
+                                                          num.freq = length(which(!is.na(time.since.last.event))),
+                                                          min.freq = as.integer(min(time.since.last.event, na.rm = TRUE)), 
+                                                          max.freq = as.integer(max(time.since.last.event, na.rm = TRUE)), 
+                                                          q1.freq = as.integer(quantile(time.since.last.event, probs = 0.25,na.rm = TRUE)), 
+                                                          q3.freq = as.integer(quantile(time.since.last.event, probs = 0.75,na.rm = TRUE)),
+                                                          avg.freq = as.integer(mean(time.since.last.event, na.rm = TRUE)),
+                                                          perctentile.last.seen = sum(time.since.last.event <= last.seen.days, 
+                                                                                      na.rm = TRUE)/length(which(!is.na(time.since.last.event))))
+```
+
+
+```{r, echo = FALSE}
+frequency <- merge(x= frequency, y = tenure[,c('id', 'tenure')], by= 'id', all.x = TRUE)
+summary(frequency)
+```
+
+## 4.2. Clustering
+
+### 4.2.1 Hierarchical Clustering
+
+```{r, echo = FALSE}
+frequency <- na.omit(frequency)
+clust.data <- scale(frequency[,c(2,4,10,11)])
+clusters <- hclust(dist(clust.data))
+plot(clusters)
+```
+```{r, echo = FALSE}
+# Split to 10 groups and compare groups
+frequency$hclust.groups <- cutree(clusters, k=10)
+```
+
+```{r, echo = FALSE}
+agg.data <- frequency %>% group_by(hclust.groups) %>% summarise(avg.perc.last.seen = mean(perctentile.last.seen, na.rm = TRUE),
+                                                             avg.last.seen.days = mean(last.seen.days), na.rm = TRUE,
+                                                             avg.tenure = mean(tenure, na.rm = TRUE), 
+                                                             avg.total.freq = mean(num.freq, na.rm = TRUE))
+ggplot(agg.data, aes(x=hclust.groups, y= avg.perc.last.seen)) + 
+  geom_line()
+ggplot(agg.data, aes(x=hclust.groups, y= avg.last.seen.days)) + 
+  geom_line()
+ggplot(agg.data, aes(x=hclust.groups, y= avg.tenure)) + 
+  geom_line()
+ggplot(agg.data, aes(x=hclust.groups, y= avg.total.freq)) + 
+  geom_line()
+
+```
+
+Observation: There are groups with distinct features emerging from the analysis but some groups maybe sparsely populated
+
+```{r, echo = FALSE}
+frequency %>% group_by(hclust.groups) %>% summarise(n= length(id)) %>% arrange(desc(n))
+```
+
+Obervation: There are six groups with more than 100 observations; top 3 groups cover ~80% and top 4 cover ~90% of the ids
+
+### 4.2.2 Mean Shift
+
+```{r, echo = FALSE}
+library(meanShiftR)
+ms.result <- meanShift(na.omit(clust.data))
+frequency$ms.groups <- ms.result$assignment
+```
+
+```{r, echo = FALSE}
+frequency %>% group_by(ms.groups)  %>% summarise(n= length(id)) %>% arrange(desc(n))
+```
+
+Observation: Top 3 groups contain ~85% of the ids
+
+### 4.2.3 K-means clustering and selection of K
+
+```{r, echo = FALSE}
+clust.data <- scale(frequency[,c(2,4,9,10,11)])
+```
+
+```{r, echo = FALSE}
+# Elbow method using sum of squares
+fviz_nbclust(clust.data, kmeans, method = "wss")
+```
+
+
+```{r, echo = FALSE}
+# average silhouette for k clusters
+fviz_nbclust(clust.data, kmeans, method = "silhouette")
+```
+
+
+```{r, echo = FALSE}
+set.seed(123456)
+km.clusters <- kmeans(clust.data, centers = 3, nstart = 25)
+frequency$km.groups <- km.clusters$cluster
+
+
+agg.data <- frequency %>% group_by(km.groups) %>% summarise(avg.perc.last.seen = mean(perctentile.last.seen, na.rm = TRUE),
+                                                             avg.last.seen.days = mean(last.seen.days, na.rm = TRUE),
+                                                             avg.tenure = mean(tenure, na.rm = TRUE), 
+                                                             avg.total.freq = mean(num.freq, na.rm = TRUE))
+
+ggplot(agg.data, aes(x=km.groups, y= avg.perc.last.seen)) + 
+  geom_line()
+ggplot(agg.data, aes(x=km.groups, y= avg.last.seen.days)) + 
+  geom_line()
+ggplot(agg.data, aes(x=km.groups, y= avg.tenure)) + 
+  geom_line()
+ggplot(agg.data, aes(x=km.groups, y= avg.total.freq)) + 
+  geom_line()
+```
+
+
+## 4.3 Key Findings
+
+* Results from Hierarchical Clustering, Meanshift, and K-means clusters suggests that there are 3 major clusters in the data
+
+* Variables used for clustering: 
+  1) Percentile last seen: Percentile of Last seen days in the distribution of inter-arrival time of the customer
+  2) Last seen days: Number of days from last activity till end of observation period
+  3) Tenure: Number of days the ID was on the system in the observation period
+  4) Total Freq: Number of activities in the observation peroid
+  
+  (Observation peroid was between 1/1/2011 to 12/31/2014)
+  
+* Group 1 from the above K-means clustering results can be identified "sleeping customers". These 210 customers had a long tenure in the observation period but haven't visited the website recently. These accounts are dormant but haven't been cancelled yet.
